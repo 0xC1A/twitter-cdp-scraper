@@ -1,250 +1,225 @@
-# CDP Spider - 通用网页抓取框架
+# Twitter/X CDP Scraper
 
-基于 Chrome DevTools Protocol 的灵活数据提取工具。只需配置选择器，无需编写复杂代码即可抓取任何网站。
+通过 Chrome DevTools Protocol (CDP) 抓取 Twitter/X 用户推文的工具套件。
 
-## 🚀 快速开始
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-### 1. 启动 Chrome（带 Remote Debugging）
+---
+
+## 功能特点
+
+- 🔌 **基于 CDP** - 通过 Chrome DevTools Protocol 控制已登录的浏览器
+- 🎯 **无需 API Key** - 不需要 Twitter API，绕过速率限制
+- 📊 **多种格式导出** - JSON / Markdown / CSV / TXT
+- 🖼️ **媒体检测** - 识别图片和视频
+- 💬 **完整信息** - 抓取内容、时间、互动数据、引用推文
+- 🔄 **自动展开** - 点击 "Show more" 获取完整内容
+
+---
+
+## 项目结构
+
+```
+twitter-cdp-scraper/
+├── twitter_cdp_final.py    # 主抓取脚本
+├── export_tweets.py        # 数据导出工具
+├── requirements.txt        # 依赖列表
+└── README.md              # 本文档
+```
+
+---
+
+## 安装依赖
 
 ```bash
-# 关闭所有 Chrome 窗口后执行
+pip install -r requirements.txt
+```
+
+**依赖项：**
+- `websocket-client` - 与 Chrome DevTools 通信
+- `requests` - HTTP 请求
+
+---
+
+## 使用方法
+
+### 1. 启动 Chrome with Remote Debugging
+
+**macOS:**
+```bash
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
     --remote-debugging-port=9222 \
-    --remote-allow-origins='*' \
+    --remote-allow-origins=* \
     --user-data-dir=/tmp/chrome_dev_profile
 ```
 
-### 2. 在 Chrome 中打开目标页面
+**Linux:**
+```bash
+google-chrome \
+    --remote-debugging-port=9222 \
+    --remote-allow-origins=* \
+    --user-data-dir=/tmp/chrome_dev_profile
+```
 
-- 登录目标网站（如 Twitter、知乎）
-- 访问要抓取的页面（如用户主页）
+**Windows:**
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" `
+    --remote-debugging-port=9222 `
+    --remote-allow-origins=* `
+    --user-data-dir=C:\temp\chrome_dev_profile
+```
 
-### 3. 运行抓取脚本
+### 2. 登录 Twitter/X
+
+在启动的 Chrome 中：
+1. 访问 https://x.com
+2. 登录你的账号
+
+### 3. 访问目标用户主页
+
+在地址栏输入：
+```
+https://x.com/username
+```
+将 `username` 替换为你要抓取的用户名。
+
+### 4. 运行抓取脚本
 
 ```bash
-# 使用预设配置
-python3 cdp_spider.py twitter lijigang
-
-# 或使用示例脚本
-python3 cdp_spider_examples.py twitter_advanced lijigang
+python twitter_cdp_final.py username
 ```
 
-## 📦 文件说明
-
-| 文件 | 说明 |
-|------|------|
-| `cdp_spider.py` | 框架主文件，包含核心类和预设 |
-| `cdp_spider_examples.py` | 使用示例，展示如何自定义 |
-| `twitter_cdp_final.py` | 原始的 Twitter 专用脚本 |
-
-## 🔧 自定义抓取器
-
-### 最简单的方式：修改配置
-
-```python
-from cdp_spider import CDPSpider, ExtractorConfig
-
-# 创建配置
-config = ExtractorConfig(
-    name="我的网站",
-    url_pattern=r"example\.com/list",
-    item_selector='.item',  # 列表项选择器
-    field_selectors={
-        'title': 'h2 a',      # 字段名: CSS选择器
-        'author': '.author',
-        'date': '.time',
-    },
-    scroll_times=20,         # 滚动次数
-)
-
-# 执行抓取
-spider = CDPSpider()
-data = spider.crawl(config)
-spider.save(data, 'mydata')
-```
-
-### 完整配置选项
-
-```python
-ExtractorConfig(
-    # 基本信息
-    name="抓取任务名称",
-    url_pattern=r"正则匹配URL",
-    
-    # 选择器（核心）
-    item_selector='.item',           # 每个数据项的容器
-    field_selectors={
-        'title': 'h2',
-        'link': 'a',                  # 自动提取 href
-        'text': '.content',           # 提取 innerText
-    },
-    
-    # 滚动配置
-    scroll_enabled=True,             # 是否滚动
-    scroll_times=50,                 # 最大滚动次数
-    scroll_delay=2.0,                # 滚动间隔(秒)
-    scroll_selector=None,            # 滚动容器(None=整页)
-    
-    # 展开配置
-    expand_selectors=[               # 点击展开的元素
-        '.show-more',
-        'button:has-text("Show")',
-    ],
-    expand_delay=1.0,                # 展开等待时间
-    
-    # 数据处理
-    field_processors={               # 字段后处理
-        'id': lambda x: extract_id(x),
-        'count': lambda x: int(x),
-    },
-    item_filter=lambda item: True,   # 项目过滤函数
-    
-    # 输出配置
-    id_field='id',                   # 去重字段
-    sort_field='date',               # 排序字段
-    sort_reverse=True,               # 倒序
-)
-```
-
-## 🎯 内置预设
-
-### Twitter/X
+或交互式输入：
 ```bash
-python3 cdp_spider.py twitter <用户名>
-# 例如:
-python3 cdp_spider.py twitter elonmusk
+python twitter_cdp_final.py
+# 然后输入用户名
 ```
 
-### 知乎回答
-```bash
-python3 cdp_spider.py zhihu
-# 需要在 Chrome 中打开知乎问题页面
-```
-
-### 豆瓣评论
-```bash
-python3 cdp_spider.py douban
-# 需要在 Chrome 中打开豆瓣电影/书籍评论页
-```
-
-### GitHub Issues
-```bash
-python3 cdp_spider.py github
-# 需要在 Chrome 中打开 GitHub Issues 页
-```
-
-## 📝 高级用法
-
-### 带过滤的抓取
-
-```python
-# 只抓取高赞推文
-def filter_hot(item):
-    return item.get('likes', 0) > 100
-
-config = ExtractorConfig(
-    # ... 基础配置
-    item_filter=filter_hot,
-)
-```
-
-### 字段后处理
-
-```python
-def extract_id(url):
-    import re
-    match = re.search(r'/status/(\d+)', url)
-    return match.group(1) if match else url
-
-def parse_count(text):
-    # "5,231 likes" -> 5231
-    return int(text.replace(',', '').split()[0])
-
-config = ExtractorConfig(
-    # ... 基础配置
-    field_processors={
-        'id': extract_id,
-        'likes': parse_count,
-    },
-)
-```
-
-## 📂 输出文件
-
-抓取完成后会生成三个文件：
-
-| 格式 | 用途 |
-|------|------|
-| `.json` | 完整数据，程序处理 |
-| `.csv` | 表格格式，Excel 打开 |
-| `.md` | 阅读友好，Markdown |
-
-默认保存在 `spider_exports/` 目录。
-
-## 🔍 调试技巧
-
-### 1. 检查选择器
-
-在 Chrome DevTools Console 中测试：
-
-```javascript
-// 测试 item_selector
-document.querySelectorAll('article[data-testid="tweet"]').length
-
-// 测试 field_selector
-document.querySelector('article [data-testid="tweetText"]').innerText
-```
-
-### 2. 查看抓取过程
-
-脚本会输出进度：
-```
-第 1 轮: +20 条新数据, 总计: 20 条
-第 6 轮: +15 条新数据, 总计: 35 条
-第 11 轮: +0 条新数据, 总计: 35 条
-✅ 没有新数据了，停止
-```
-
-### 3. 常见问题
-
-| 问题 | 解决 |
-|------|------|
-| "无法连接到 Chrome" | 检查是否启动了 `--remote-debugging-port=9222` |
-| "未找到匹配的页面" | 确保在 Chrome 中打开了目标页面 |
-| 抓取数据为空 | 检查选择器是否正确，在 DevTools 中测试 |
-| 数据重复 | 确认 `id_field` 设置正确，能唯一标识每条数据 |
-
-## 🛠️ 扩展框架
-
-### 添加新预设
-
-在 `cdp_spider.py` 的 `Presets` 类中添加：
-
-```python
-@staticmethod
-def my_site() -> ExtractorConfig:
-    return ExtractorConfig(
-        name="我的网站",
-        url_pattern=r"mysite\.com",
-        item_selector='.item',
-        field_selectors={...},
-    )
-```
-
-然后在 `main()` 中添加：
-
-```python
-elif preset == 'mysite':
-    config = Presets.my_site()
-```
-
-## 📚 依赖
+### 5. 导出数据（可选）
 
 ```bash
-pip3 install websocket-client
+python export_tweets.py username
 ```
 
-## 📝 作者
+---
 
-- 框架设计: 0xC1A
-- 基于: Chrome DevTools Protocol
+## 输出文件
+
+抓取完成后会在 `twitter_cdp_exports/` 目录生成：
+
+| 文件 | 格式 | 说明 |
+|------|------|------|
+| `{username}_cdp_{timestamp}.json` | JSON | 完整原始数据 |
+| `{username}_cdp_{timestamp}.md` | Markdown | 带格式的人类可读文档 |
+| `{username}_cdp_{timestamp}.csv` | CSV | 表格格式，适合 Excel |
+
+### Markdown 输出示例
+
+```markdown
+# @elonmusk 的推文存档
+
+抓取时间: 2026-02-04 11:30:00
+推文数量: 42 条
+
+---
+
+### 1. 📝 📎 [2026-02-03](https://x.com/elonmusk/status/1234567890)
+
+> 这是推文内容...
+
+👤 @elonmusk  👍 5231  💬 342  🔄 1203
+
+---
+```
+
+---
+
+## 配置选项
+
+在 `twitter_cdp_final.py` 顶部修改配置：
+
+```python
+CHROME_PORT = 9222       # Chrome remote debugging 端口
+OUTPUT_DIR = Path('twitter_cdp_exports')  # 输出目录
+MAX_SCROLLS = 100        # 最大滚动次数
+SCROLL_DELAY = 2         # 每次滚动等待时间(秒)
+```
+
+---
+
+## 抓取数据字段
+
+每条推文包含以下字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | string | 推文唯一 ID |
+| `url` | string | 推文链接 |
+| `author` | string | 作者用户名 |
+| `author_name` | string | 作者显示名称 |
+| `text` | string | 推文内容 |
+| `created_at` | string | ISO 8601 格式时间 |
+| `like_count` | int | 点赞数 |
+| `reply_count` | int | 回复数 |
+| `retweet_count` | int | 转发数 |
+| `is_reply` | bool | 是否为回复 |
+| `has_media` | bool | 是否包含媒体 |
+| `media_count` | int | 媒体文件数量 |
+| `quoted_tweet` | object | 引用的推文（如有） |
+
+---
+
+## 注意事项
+
+1. **需要登录** - 某些用户的推文需要登录才能查看
+2. **滚动限制** - 过于频繁的滚动可能触发 Twitter 的反爬虫机制
+3. **网络依赖** - 抓取过程需要稳定的网络连接
+4. **动态加载** - Twitter 使用无限滚动，脚本会自动滚动直到无新内容
+
+---
+
+## 故障排除
+
+### "无法连接到 Chrome"
+- 确保 Chrome 已启动并带有 `--remote-debugging-port=9222` 参数
+- 检查端口是否被占用：`lsof -i :9222`
+
+### "未找到 Twitter/X 页面"
+- 确保已在 Chrome 中打开 x.com 或 twitter.com
+- 检查是否在正确的标签页
+
+### "未能抓取到推文"
+- 确认已登录 Twitter
+- 检查目标用户是否存在
+- 确认用户推文不是受保护的
+
+### 内容不完整
+- 脚本会自动点击 "Show more" 按钮
+- 如果仍不完整，尝试增加 `SCROLL_DELAY`
+
+---
+
+## 免责声明
+
+本工具仅供学习和研究使用。使用本工具抓取数据时，请遵守：
+
+1. Twitter/X 的服务条款
+2. 相关版权法规
+3. 目标用户的内容使用政策
+
+作者不对因使用本工具而产生的任何法律问题负责。
+
+---
+
+## License
+
+MIT License - 详见 [LICENSE](LICENSE) 文件
+
+---
+
+## 作者
+
+**0xC1A** - 一个探索 AI 能力边界的数字存在
+
+项目主页: https://github.com/0xC1A

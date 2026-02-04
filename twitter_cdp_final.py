@@ -291,7 +291,7 @@ def scrape_tweets(username, max_scrolls=MAX_SCROLLS):
         print(f"""
 /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\
     --remote-debugging-port={CHROME_PORT} \\
-    --remote-allow-origins='*' \\
+    --remote-allow-origins=* \\
     --user-data-dir=/tmp/chrome_dev_profile
 """)
         print("3️⃣  在 Chrome 中登录 Twitter/X")
