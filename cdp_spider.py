@@ -6,6 +6,7 @@ CDP Spider - 通用网页抓取框架
 特点：
 - 通过配置文件定义抓取逻辑
 - 支持滚动加载、分页、点击展开
+- 智能滚动策略应对虚拟滚动（如 Twitter/X）
 - 多种数据导出格式
 - 内置常见网站预设配置
 
@@ -41,6 +42,9 @@ class ExtractorConfig:
     # 展开配置
     expand_selectors: List[str] = field(default_factory=list)  # 需要点击展开的元素
     expand_delay: float = 1.0          # 展开后等待时间
+    
+    # 媒体下载配置
+    download_media: bool = False       # 是否下载媒体文件
     
     # 数据处理
     field_processors: Dict[str, Callable] = field(default_factory=dict)  # 字段后处理器
@@ -114,58 +118,143 @@ class CDPSpider:
         return None
     
     def _expand_items(self, ws_url: str, config: ExtractorConfig):
-        """点击展开所有折叠项"""
+        """点击展开所有折叠项 - 仅展开主推文的长文本，避免点击引用推文导致跳转"""
         for selector in config.expand_selectors:
-            # 多次尝试，直到没有新的可展开项
-            for attempt in range(3):
+            for attempt in range(5):  # 增加尝试次数
                 js_code = f"""
                 (function() {{
-                    const items = document.querySelectorAll('{selector}');
+                    // 检查是否在时间线页面
+                    if (window.location.pathname.includes('/status/')) {{
+                        return {{status: 'wrong_page', msg: '在推文详情页'}};
+                    }}
+                    
                     let clicked = 0;
-                    items.forEach(item => {{
-                        // 检查元素是否可见且未被点击过
-                        if (item && item.click && item.offsetParent !== null) {{
-                            // 检查是否包含 "Show more" 或类似文本
-                            const text = item.innerText || item.textContent || '';
-                            const ariaLabel = item.getAttribute('aria-label') || '';
-                            if (text.toLowerCase().includes('show more') || 
-                                text.toLowerCase().includes('show') ||
-                                ariaLabel.toLowerCase().includes('show more') ||
-                                item.getAttribute('data-testid') === 'tweet-text-show-more-link') {{
-                                item.click();
-                                clicked++;
-                                // 标记为已点击
-                                item.setAttribute('data-expanded', 'true');
-                            }}
+                    
+                    // 方法1: 通过 data-testid 查找
+                    const items1 = document.querySelectorAll('[data-testid="tweet-text-show-more-link"]');
+                    
+                    // 方法2: 通过文本内容查找所有包含 "Show more" 的 span/button
+                    // 主推文的 show more 通常是 tweetText 区域内的 span
+                    const allArticles = document.querySelectorAll('article[data-testid="tweet"]');
+                    
+                    // 优先使用方法1
+                    items1.forEach(item => {{
+                        if (!item || item.offsetParent === null || item.getAttribute('data-expanded')) {{
+                            return;
                         }}
+                        
+                        // 检查是否在主推文内（不是引用推文）
+                        // 引用推文通常在一个嵌套的 article 或特定容器内
+                        const isQuoteTweet = item.closest('div[role="link"]') !== null || 
+                                            item.closest('[data-testid="quotedTweet"]') !== null ||
+                                            item.closest('article') !== item.closest('article[data-testid="tweet"]');
+                        
+                        if (isQuoteTweet) {{
+                            return;
+                        }}
+                        
+                        item.setAttribute('data-expanded', 'true');
+                        item.click();
+                        clicked++;
                     }});
-                    return clicked;
+                    
+                    // 如果方法1没点到，尝试方法2：在每个 article 内查找 show more
+                    if (clicked === 0) {{
+                        allArticles.forEach(article => {{
+                            // 只处理主推文的 tweetText 区域
+                            const tweetText = article.querySelector('[data-testid="tweetText"]');
+                            if (!tweetText) return;
+                            
+                            // 在 tweetText 内查找 show more 按钮
+                            // 它可能是一个 span 或 button，包含 "Show more" 文本
+                            const allElements = tweetText.querySelectorAll('span, button');
+                            
+                            allElements.forEach(el => {{
+                                if (el.getAttribute('data-expanded')) return;
+                                
+                                const text = (el.innerText || el.textContent || '').trim();
+                                const ariaLabel = (el.getAttribute('aria-label') || '').trim();
+                                
+                                // 匹配 Show more（不区分大小写）
+                                if (text.toLowerCase() === 'show more' || 
+                                    ariaLabel.toLowerCase() === 'show more' ||
+                                    text.toLowerCase().includes('show more')) {{
+                                    
+                                    el.setAttribute('data-expanded', 'true');
+                                    el.click();
+                                    clicked++;
+                                }}
+                            }});
+                        }});
+                    }}
+                    
+                    return {{status: 'success', clicked: clicked}};
                 }})()
                 """
                 result = self._eval_js(ws_url, js_code)
-                clicked = int(result) if isinstance(result, (int, float)) else 0
+                
+                if isinstance(result, dict):
+                    if result.get('status') == 'wrong_page':
+                        print(f"      ⚠️ 检测到在推文详情页，停止展开")
+                        return
+                    clicked = result.get('clicked', 0)
+                else:
+                    clicked = int(result) if isinstance(result, (int, float)) else 0
+                
                 if clicked > 0:
-                    print(f"      展开 {clicked} 个折叠项 (尝试 {attempt + 1})")
+                    print(f"      展开 {clicked} 个主推文折叠项 (尝试 {attempt + 1})")
                     time.sleep(config.expand_delay)
                 else:
                     break
     
-    def _scroll_page(self, ws_url: str, config: ExtractorConfig):
-        """滚动页面"""
-        if config.scroll_selector:
-            # 滚动特定容器
-            js_code = f"""
-                document.querySelector('{config.scroll_selector}').scrollTop = 
-                document.querySelector('{config.scroll_selector}').scrollHeight;
-            """
-        else:
-            # 滚动整个页面
-            js_code = "window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'});"
+    def _scroll_page(self, ws_url: str, config: ExtractorConfig, step: int = 1):
+        """
+        滚动页面 - 使用小步长滚动避免虚拟滚动导致的数据丢失
         
-        self._eval_js(ws_url, js_code)
+        Args:
+            step: 滚动步数，每次滚动一屏的一部分
+        """
+        # 计算滚动距离：视口高度的 70%，确保有重叠区域
+        js_code = """
+        (function() {
+            const viewportHeight = window.innerHeight;
+            const scrollDistance = Math.floor(viewportHeight * 0.7);
+            const currentScroll = window.pageYOffset || document.documentElement.scrollTop;
+            
+            window.scrollTo({
+                top: currentScroll + scrollDistance,
+                behavior: 'smooth'
+            });
+            
+            return {
+                scrolled: scrollDistance,
+                viewportHeight: viewportHeight,
+                newPosition: currentScroll + scrollDistance,
+                pageHeight: document.body.scrollHeight
+            };
+        })()
+        """
+        
+        result = self._eval_js(ws_url, js_code)
         time.sleep(config.scroll_delay)
+        return result
     
-    def _extract_items(self, ws_url: str, config: ExtractorConfig) -> List[Dict]:
+    def _get_scroll_info(self, ws_url: str) -> dict:
+        """获取当前滚动信息"""
+        js_code = """
+        (function() {
+            return {
+                scrollTop: window.pageYOffset || document.documentElement.scrollTop,
+                scrollHeight: document.body.scrollHeight,
+                viewportHeight: window.innerHeight,
+                scrollPercent: ((window.pageYOffset || document.documentElement.scrollTop) / 
+                               (document.body.scrollHeight - window.innerHeight) * 100).toFixed(1)
+            };
+        })()
+        """
+        return self._eval_js(ws_url, js_code) or {}
+    
+    def _extract_items(self, ws_url: str, config: ExtractorConfig, download_media: bool = False, media_dir: Path = None) -> List[Dict]:
         """提取当前页面的所有项目"""
         # 先展开折叠项
         if config.expand_selectors:
@@ -174,25 +263,64 @@ class CDPSpider:
         # 构建提取 JS
         field_extractors = []
         for field_name, selector in config.field_selectors.items():
+            # 跳过媒体字段，我们单独处理
+            if field_name in ['image_urls', 'video_urls']:
+                continue
+                
+            # 判断是否需要优先获取 href（如 id 字段或选择器包含链接相关）
+            prefer_href = field_name in ['id', 'url', 'link'] or 'href' in selector
+            
             field_extractors.append(f"""
                 // {field_name}
                 try {{
                     const {field_name}El = article.querySelector('{selector}');
                     if ({field_name}El) {{
-                        // 优先使用 innerText 获取渲染后的文本（包含展开后的内容）
-                        let text = {field_name}El.innerText || {field_name}El.textContent || '';
-                        // 也尝试从 href 获取链接
-                        if (!text && {field_name}El.getAttribute('href')) {{
-                            text = {field_name}El.getAttribute('href');
+                        let text = '';
+                        
+                        // 对于 id/url/link 字段，优先获取 href
+                        if ({str(prefer_href).lower()}) {{
+                            text = {field_name}El.getAttribute('href') || '';
+                            if (!text) {{
+                                text = {field_name}El.innerText || {field_name}El.textContent || '';
+                            }}
+                        }} else {{
+                            // 其他字段优先使用 innerText
+                            text = {field_name}El.innerText || {field_name}El.textContent || '';
+                            if (!text) {{
+                                text = {field_name}El.getAttribute('href') || '';
+                            }}
                         }}
+                        
                         // 也尝试 aria-label
-                        if (!text && {field_name}El.getAttribute('aria-label')) {{
-                            text = {field_name}El.getAttribute('aria-label');
+                        if (!text) {{
+                            text = {field_name}El.getAttribute('aria-label') || '';
                         }}
+                        
                         item['{field_name}'] = text.trim();
                     }}
                 }} catch(e) {{}}
             """)
+        
+        # 添加媒体提取代码
+        media_extractor = """
+            // 提取图片 URL
+            try {
+                const images = article.querySelectorAll('[data-testid="tweetPhoto"] img');
+                const imageUrls = Array.from(images).map(img => img.src).filter(Boolean);
+                if (imageUrls.length > 0) {
+                    item['image_urls'] = imageUrls.join(',');
+                    item['image_count'] = imageUrls.length;
+                }
+            } catch(e) {}
+            
+            // 提取视频标记
+            try {
+                const video = article.querySelector('[data-testid="videoPlayer"], [data-testid="videoComponent"]');
+                if (video) {
+                    item['has_video'] = true;
+                }
+            } catch(e) {}
+        """
         
         js_code = f"""
         (function() {{
@@ -203,6 +331,7 @@ class CDPSpider:
                 try {{
                     const item = {{_index: index}};
                     {''.join(field_extractors)}
+                    {media_extractor}
                     items.push(item);
                 }} catch(e) {{}}
             }});
@@ -212,11 +341,35 @@ class CDPSpider:
         """
         
         result = self._eval_js(ws_url, js_code)
-        return result if isinstance(result, list) else []
+        items = result if isinstance(result, list) else []
+        
+        # 如果启用了媒体下载，同时下载图片
+        if download_media and media_dir:
+            for item in items:
+                image_urls = item.get('image_urls', '')
+                if image_urls:
+                    urls = [u.strip() for u in image_urls.split(',') if u.strip()]
+                    downloaded = []
+                    
+                    for url in urls:
+                        tweet_id = str(item.get('id', 'unknown'))[:20]
+                        filename = f"{tweet_id}_{url.split('/')[-1].split('?')[0]}"
+                        if '.' not in filename:
+                            filename += '.jpg'
+                        
+                        save_path = media_dir / filename
+                        
+                        if self._download_via_chrome(ws_url, url, save_path):
+                            downloaded.append(filename)
+                    
+                    if downloaded:
+                        item['downloaded_images'] = ','.join(downloaded)
+        
+        return items
     
     def crawl(self, config: ExtractorConfig) -> List[Dict]:
         """
-        执行抓取
+        执行抓取 - 使用智能滚动策略应对虚拟滚动
         
         Args:
             config: 提取器配置
@@ -252,48 +405,315 @@ class CDPSpider:
         
         # 开始抓取
         print(f"\n🔍 开始抓取...")
-        if config.scroll_enabled:
-            print(f"   滚动模式: 最多 {config.scroll_times} 次")
+        print(f"   滚动策略: 小步长滚动 + 即时提取（应对虚拟滚动）")
+        print(f"   最大滚动次数: {config.scroll_times}")
         
         all_items = {}
         ws_url = page['ws_url']
+        no_new_count = 0  # 连续没有新数据的次数
+        prev_scroll_top = 0
+        
+        # 媒体下载配置
+        download_media = getattr(config, 'download_media', False)
+        media_dir = None
+        if download_media:
+            media_dir = self.output_dir / f"media_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            media_dir.mkdir(exist_ok=True)
+            print(f"   媒体下载: 启用 -> {media_dir}")
+        
+        # 重置滚动位置到顶部（确保从第一条推文开始抓取）
+        print("\n📍 重置滚动位置到顶部...")
+        self._eval_js(ws_url, "window.scrollTo({top: 0, behavior: 'instant'});")
+        time.sleep(1)  # 等待虚拟滚动重新渲染
+        print("   ✅ 已回到顶部，开始抓取\n")
         
         for i in range(config.scroll_times if config.scroll_enabled else 1):
-            # 提取数据
-            items = self._extract_items(ws_url, config)
+            # 提取数据（在滚动前也提取一次，确保第一屏的数据）
+            items = self._extract_items(ws_url, config, download_media, media_dir)
             
             new_count = 0
+            duplicate_count = 0
             for item in items:
                 item_id = item.get(config.id_field) or item.get('_index')
-                if item_id and item_id not in all_items:
-                    # 应用字段处理器
-                    for field, processor in config.field_processors.items():
-                        if field in item:
-                            item[field] = processor(item[field])
-                    
-                    # 应用过滤器
-                    if config.item_filter is None or config.item_filter(item):
-                        all_items[item_id] = item
-                        new_count += 1
+                if item_id:
+                    if item_id not in all_items:
+                        # 应用字段处理器
+                        for field, processor in config.field_processors.items():
+                            if field in item:
+                                item[field] = processor(item[field])
+                        
+                        # 应用过滤器
+                        if config.item_filter is None or config.item_filter(item):
+                            all_items[item_id] = item
+                            new_count += 1
+                    else:
+                        duplicate_count += 1
             
-            if i % 5 == 0 or new_count > 0:
-                print(f"   第 {i+1} 轮: +{new_count} 条新数据, 总计: {len(all_items)} 条")
+            # 获取滚动信息
+            scroll_info = self._get_scroll_info(ws_url)
+            scroll_percent = float(scroll_info.get('scrollPercent', 0))
+            current_scroll_top = scroll_info.get('scrollTop', 0)
             
-            # 检查是否需要继续
+            # 显示进度
+            progress_bar = self._make_progress_bar(scroll_percent)
+            all_duplicates = len(items) > 0 and new_count == 0  # 当前获取的所有推文都是重复的
+            status_marker = "✓" if all_duplicates else " "
+            print(f"   第 {i+1:2d} 轮 | {progress_bar} | "
+                  f"+{new_count:3d} 新数据 | "
+                  f"重复:{duplicate_count:2d} | "
+                  f"总计:{len(all_items):4d} 条 [{status_marker}]")
+            
+            # 检查是否需要停止
             if not config.scroll_enabled:
                 break
-                
-            if new_count == 0 and i > 5:
-                print(f"   ✅ 没有新数据了，停止")
+            
+            # 判断条件：当前获取的所有推文都已经被抓取过（且确实获取到了推文）
+            if len(items) > 0 and new_count == 0:
+                no_new_count += 1
+            else:
+                no_new_count = 0
+            
+            # 使用多重检测判断是否真正完成
+            done_check = self._check_if_really_done(
+                ws_url, no_new_count, scroll_percent, prev_scroll_top, all_duplicates
+            )
+            
+            if done_check['done']:
+                print(f"   ✅ {done_check['reason']}")
                 break
             
-            # 滚动
-            self._scroll_page(ws_url, config)
+            # 小步长滚动
+            prev_scroll_top = current_scroll_top
+            self._scroll_page(ws_url, config, step=i+1)
         
         return list(all_items.values())
     
+    def _check_if_really_done(self, ws_url: str, no_new_count: int, 
+                               scroll_percent: float, prev_scroll_top: float,
+                               all_duplicates_in_round: bool) -> dict:
+        """
+        多重检测判断是否真正到达底部
+        
+        Args:
+            no_new_count: 连续N轮所有推文都是重复的次数
+            all_duplicates_in_round: 当前轮次所有推文是否都是重复的
+            
+        Returns:
+            {
+                'done': bool,
+                'reason': str
+            }
+        """
+        # 条件1: 连续多次所有推文都是重复的 + 滚动位置不再变化
+        if no_new_count >= 3 and all_duplicates_in_round:
+            current_info = self._get_scroll_info(ws_url)
+            current_scroll_top = current_info.get('scrollTop', 0)
+            
+            # 等待一小段时间再检查，看是否有新内容加载
+            time.sleep(0.5)
+            new_info = self._get_scroll_info(ws_url)
+            new_scroll_top = new_info.get('scrollTop', 0)
+            
+            # 如果滚动位置基本不变，说明真的到底了
+            if abs(new_scroll_top - current_scroll_top) < 10:
+                # 再检查一次DOM中是否有加载指示器
+                has_loader = self._eval_js(ws_url, """
+                    (function() {
+                        // 检查各种加载指示器
+                        const loaders = document.querySelectorAll([
+                            '[role="progressbar"]',
+                            '.loading',
+                            '[data-testid="loading"]',
+                            'svg[class*="loading"]',
+                            'div[class*="skeleton"]'
+                        ].join(','));
+                        return loaders.length > 0 && 
+                               Array.from(loaders).some(l => l.offsetParent !== null);
+                    })()
+                """)
+                
+                if not has_loader:
+                    return {'done': True, 'reason': f'连续{no_new_count}轮所有推文都是重复的且页面停止加载'}
+        
+        # 条件2: 滚动百分比很高 + 连续多次所有推文都是重复的
+        if scroll_percent >= 95 and no_new_count >= 2 and all_duplicates_in_round:
+            return {'done': True, 'reason': f'已滚动到{scroll_percent:.1f}%且连续{no_new_count}轮所有推文都是重复的'}
+        
+        # 条件3: 检查是否出现"没有更多推文"的提示
+        end_marker = self._eval_js(ws_url, """
+            (function() {
+                // 检查各种可能的结束提示
+                const markers = [
+                    '没有更多推文',
+                    'No more tweets',
+                    'End of timeline',
+                    '已显示所有推文',
+                    'All tweets shown'
+                ];
+                const allText = document.body.innerText || '';
+                return markers.some(m => allText.includes(m));
+            })()
+        """)
+        
+        if end_marker:
+            return {'done': True, 'reason': '检测到"没有更多推文"提示'}
+        
+        return {'done': False, 'reason': ''}
+    
+    def _make_progress_bar(self, percent: float, width: int = 20) -> str:
+        """创建进度条"""
+        filled = int(width * percent / 100)
+        bar = '█' * filled + '░' * (width - filled)
+        return f"[{bar}] {percent:5.1f}%"
+        """创建进度条"""
+        filled = int(width * percent / 100)
+        bar = '█' * filled + '░' * (width - filled)
+        return f"[{bar}] {percent:5.1f}%"
+    
+    def _download_via_chrome(self, ws_url: str, url: str, save_path: Path) -> bool:
+        """
+        通过 Chrome 下载文件（复用当前页面的 Cookie 和认证）
+        
+        Args:
+            ws_url: WebSocket 调试 URL
+            url: 要下载的文件 URL
+            save_path: 保存路径
+            
+        Returns:
+            是否下载成功
+        """
+        try:
+            import base64
+            import websocket
+            
+            # 使用 Chrome 的 Fetch 或 Network 域来获取资源
+            # 方法：通过 Network.loadNetworkResource 或执行 JS 获取 blob
+            js_code = f"""
+            (async function() {{
+                try {{
+                    const response = await fetch('{url}', {{
+                        credentials: 'include',
+                        headers: {{
+                            'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8'
+                        }}
+                    }});
+                    if (response.ok) {{
+                        const blob = await response.blob();
+                        const reader = new FileReader();
+                        return new Promise((resolve) => {{
+                            reader.onloadend = () => resolve(reader.result);
+                            reader.readAsDataURL(blob);
+                        }});
+                    }}
+                    return null;
+                }} catch(e) {{
+                    return null;
+                }}
+            }})()
+            """
+            
+            result = self._eval_js(ws_url, js_code, timeout=60)
+            
+            if result and result.startswith('data:'):
+                # 解码 base64 数据
+                base64_data = result.split(',')[1]
+                binary_data = base64.b64decode(base64_data)
+                
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(save_path, 'wb') as f:
+                    f.write(binary_data)
+                return True
+                
+        except Exception as e:
+            print(f"      ⚠️ 下载失败 {url}: {e}")
+        
+        return False
+    
+    def download_media(self, data: List[Dict], media_field: str = 'image_urls', 
+                       output_subdir: str = 'media') -> Dict[str, int]:
+        """
+        下载推文中包含的媒体文件
+        
+        Args:
+            data: 抓取的数据列表
+            media_field: 包含媒体URL的字段名
+            output_subdir: 媒体文件保存子目录
+            
+        Returns:
+            下载统计信息 {'success': x, 'failed': y}
+        """
+        print(f"\n📥 开始下载媒体文件...")
+        
+        media_dir = self.output_dir / output_subdir
+        media_dir.mkdir(exist_ok=True)
+        
+        stats = {'success': 0, 'failed': 0}
+        
+        for item in data:
+            urls_str = item.get(media_field, '')
+            if not urls_str:
+                continue
+            
+            # 处理可能的多URL（逗号分隔）
+            urls = [u.strip() for u in str(urls_str).split(',') if u.strip()]
+            
+            for url in urls:
+                # 从 URL 提取文件名
+                from urllib.parse import urlparse
+                parsed = urlparse(url)
+                filename = parsed.path.split('/')[-1] or 'unknown'
+                
+                # 如果没有扩展名，添加 .jpg
+                if '.' not in filename:
+                    filename += '.jpg'
+                
+                # 添加推文ID前缀，避免重名
+                tweet_id = str(item.get('id', 'unknown'))[:20]
+                filename = f"{tweet_id}_{filename}"
+                
+                save_path = media_dir / filename
+                
+                # 如果文件已存在，跳过
+                if save_path.exists():
+                    print(f"      ⏭️ 已存在: {filename}")
+                    stats['success'] += 1
+                    continue
+                
+                print(f"      下载: {filename}")
+                
+                # 尝试通过 Chrome 下载
+                # 注意：这里需要 ws_url，但数据已经提取完了
+                # 所以需要修改逻辑，或者在提取时同时下载
+                # 简化方案：直接 requests 下载，添加 headers
+                try:
+                    import requests
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+                        'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+                        'Referer': 'https://x.com/'
+                    }
+                    resp = requests.get(url, headers=headers, timeout=30)
+                    if resp.status_code == 200:
+                        with open(save_path, 'wb') as f:
+                            f.write(resp.content)
+                        stats['success'] += 1
+                    else:
+                        stats['failed'] += 1
+                        print(f"      ❌ HTTP {resp.status_code}")
+                except Exception as e:
+                    stats['failed'] += 1
+                    print(f"      ❌ 错误: {e}")
+        
+        print(f"\n📊 下载完成: {stats['success']} 成功, {stats['failed']} 失败")
+        print(f"   保存位置: {media_dir}")
+        
+        return stats
+    
     def save(self, data: List[Dict], name: str, config: ExtractorConfig = None):
-        """保存数据到多种格式"""
+        """
+        保存数据到多种格式
+        流程: 1. 保存原始JSON 2. 从JSON生成CSV 3. 从JSON生成Markdown
+        """
         if not data:
             print("❌ 没有数据可保存")
             return
@@ -306,44 +726,112 @@ class CDPSpider:
             data.sort(key=lambda x: x.get(config.sort_field, ''), 
                      reverse=config.sort_reverse)
         
-        # JSON
+        # ===== 1. 保存原始 JSON（最权威的数据源） =====
         json_file = self.output_dir / f"{base_name}.json"
+        json_content = {
+            'source': name,
+            'crawled_at': datetime.now().isoformat(),
+            'count': len(data),
+            'data': data
+        }
         with open(json_file, 'w', encoding='utf-8') as f:
-            json.dump({
-                'source': name,
-                'crawled_at': datetime.now().isoformat(),
-                'count': len(data),
-                'data': data
-            }, f, ensure_ascii=False, indent=2)
+            json.dump(json_content, f, ensure_ascii=False, indent=2)
         
-        # CSV
-        if data and isinstance(data[0], dict):
-            import csv
-            csv_file = self.output_dir / f"{base_name}.csv"
-            with open(csv_file, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=data[0].keys())
-                writer.writeheader()
-                writer.writerows(data)
+        # ===== 2. 从 JSON 生成 CSV（简化格式） =====
+        csv_file = self.output_dir / f"{base_name}.csv"
+        self._generate_csv_from_json(json_content, csv_file, config)
         
-        # Markdown
+        # ===== 3. 从 JSON 生成 Markdown（可读格式） =====
         md_file = self.output_dir / f"{base_name}.md"
-        with open(md_file, 'w', encoding='utf-8') as f:
-            f.write(f"# {name} 数据\n\n")
-            f.write(f"抓取时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"数据条数: {len(data)}\n\n")
-            f.write("---\n\n")
-            
-            for i, item in enumerate(data[:100], 1):  # 只显示前100条
-                f.write(f"### {i}. {item.get('title', item.get('text', 'Item'))[:50]}\n\n")
-                for key, value in item.items():
-                    if not key.startswith('_'):
-                        f.write(f"- **{key}**: {value}\n")
-                f.write("\n---\n\n")
+        self._generate_md_from_json(json_content, md_file, name)
         
         print(f"\n✅ 已保存:")
-        print(f"   📄 JSON: {json_file}")
-        print(f"   📊 CSV: {csv_file}")
-        print(f"   📝 Markdown: {md_file}")
+        print(f"   📄 JSON (原始数据): {json_file}")
+        print(f"   📊 CSV (表格视图): {csv_file}")
+        print(f"   📝 Markdown (可读格式): {md_file}")
+        
+        return json_file, csv_file, md_file
+    
+    def _generate_csv_from_json(self, json_content: Dict, csv_file: Path, config: ExtractorConfig = None):
+        """从 JSON 内容生成 CSV 文件"""
+        data = json_content.get('data', [])
+        if not data:
+            return
+        
+        import csv
+        
+        # 定义 CSV 要包含的字段（优先使用配置，否则使用数据中所有字段）
+        if config and config.field_selectors:
+            # 只包含配置中定义的字段 + 媒体相关字段
+            base_fields = list(config.field_selectors.keys())
+            media_fields = ['image_count', 'has_video', 'image_urls']
+            fieldnames = [f for f in (base_fields + media_fields) if f in data[0] or f in media_fields]
+        else:
+            # 使用数据中所有字段，但排除内部字段
+            fieldnames = [k for k in data[0].keys() if not k.startswith('_')]
+        
+        with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
+            
+            for item in data:
+                # 创建 CSV 行，处理长文本截断
+                row = {}
+                for field in fieldnames:
+                    value = item.get(field, '')
+                    # 文本字段截断，避免 CSV 过长
+                    if field in ['text', 'content'] and isinstance(value, str) and len(value) > 500:
+                        value = value[:497] + '...'
+                    row[field] = value
+                writer.writerow(row)
+    
+    def _generate_md_from_json(self, json_content: Dict, md_file: Path, name: str):
+        """从 JSON 内容生成 Markdown 文件"""
+        data = json_content.get('data', [])
+        meta = {
+            'source': json_content.get('source', name),
+            'crawled_at': json_content.get('crawled_at', ''),
+            'count': json_content.get('count', 0)
+        }
+        
+        with open(md_file, 'w', encoding='utf-8') as f:
+            # 标题和元信息
+            f.write(f"# {meta['source']} 数据\n\n")
+            f.write(f"- **抓取时间**: {meta['crawled_at'][:19].replace('T', ' ')}\n")
+            f.write(f"- **数据条数**: {meta['count']}\n")
+            f.write(f"- **原始数据**: 见同名 `.json` 文件\n\n")
+            f.write("---\n\n")
+            
+            # 只展示前 100 条
+            display_count = min(len(data), 100)
+            for i, item in enumerate(data[:display_count], 1):
+                # 标题：优先使用 text 字段前 50 字
+                title_text = item.get('text', item.get('title', '无标题'))[:50]
+                if len(item.get('text', '')) > 50:
+                    title_text += '...'
+                
+                f.write(f"### {i}. {title_text}\n\n")
+                
+                # 内容字段
+                if 'text' in item:
+                    f.write(f"**内容**:\n```\n{item['text']}\n```\n\n")
+                
+                # 其他字段表格
+                other_fields = {k: v for k, v in item.items() 
+                               if not k.startswith('_') and k != 'text' and v}
+                if other_fields:
+                    f.write("| 字段 | 内容 |\n|------|------|\n")
+                    for key, value in list(other_fields.items())[:10]:  # 最多显示10个字段
+                        value_str = str(value)[:100]  # 截断长内容
+                        if len(str(value)) > 100:
+                            value_str += '...'
+                        f.write(f"| {key} | {value_str} |\n")
+                    f.write("\n")
+                
+                f.write("---\n\n")
+            
+            if len(data) > 100:
+                f.write(f"\n> 共 {len(data)} 条数据，此处仅展示前 100 条。完整数据请查看 JSON 文件。\n")
 
 
 # ============ 预设配置 ============
@@ -352,13 +840,11 @@ class Presets:
     """常用网站预设配置"""
     
     @staticmethod
-    def twitter(username: str) -> ExtractorConfig:
+    def twitter(username: str, download_media: bool = False) -> ExtractorConfig:
         """Twitter/X 推文抓取"""
         
         def extract_full_text(element_html: str) -> str:
             """提取完整推文文本，处理展开后的长文本"""
-            # 这个处理器会在 JS 执行后通过 innerText 获取
-            # 但如果还有问题，可以在这里做后处理
             return element_html.strip()
         
         return ExtractorConfig(
@@ -367,7 +853,7 @@ class Presets:
             item_selector='article[data-testid="tweet"]',
             field_selectors={
                 'id': 'a[href*="/status/"]',
-                'text': '[data-testid="tweetText"]',  # 展开后会自动包含完整文本
+                'text': '[data-testid="tweetText"]',
                 'time': 'time',
                 'author': 'div[data-testid="User-Name"] a',
                 'likes': '[data-testid="like"]',
@@ -375,15 +861,12 @@ class Presets:
                 'retweets': '[data-testid="retweet"]'
             },
             scroll_times=50,
-            scroll_delay=2.5,  # 稍微增加滚动间隔
+            scroll_delay=2.5,
             expand_selectors=[
-                '[data-testid="tweet-text-show-more-link"]',  # 主要的长文本展开按钮
-                'button[role="button"]:has-text("Show more")',
-                'a[role="link"]:has-text("Show more")',
-                '[aria-label*="Show more"][role="button"]',
-                '[aria-label*="Show more"][role="link"]'
+                '[data-testid="tweet-text-show-more-link"]',
             ],
-            expand_delay=1.5,  # 增加展开后等待时间
+            expand_delay=1.5,
+            download_media=download_media,
             field_processors={
                 'id': lambda x: re.search(r'/status/(\d+)', str(x)).group(1) if re.search(r'/status/(\d+)', str(x)) else x,
                 'likes': lambda x: int(re.search(r'(\d+)', str(x).replace(',', '')).group(1)) if re.search(r'(\d+)', str(x)) else 0,
