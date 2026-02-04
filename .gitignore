@@ -22,28 +22,22 @@ wheels/
 
 # Virtual environments
 venv/
-ENV/
 env/
+ENV/
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Output directories (user data)
-twitter_cdp_exports/
-twitter_archives/
-twitter_exports/
-
-# Logs
-*.log
-
-# Chrome profile
-/tmp/chrome_dev_profile/
-chrome_dev_profile/
+# Project specific
+spider_exports/
+*.json
+*.csv
+!/example*.json
+!/example*.csv
