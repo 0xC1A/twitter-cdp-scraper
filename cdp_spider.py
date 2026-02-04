@@ -114,34 +114,28 @@ class CDPSpider:
         return None
     
     def _expand_items(self, ws_url: str, config: ExtractorConfig):
-        """点击展开所有折叠项 - 仅展开长文本，不跳转页面"""
+        """点击展开所有折叠项"""
         for selector in config.expand_selectors:
             # 多次尝试，直到没有新的可展开项
             for attempt in range(3):
                 js_code = f"""
                 (function() {{
-                    // 只在当前页面（时间线）执行，不在推文详情页执行
-                    if (window.location.pathname.includes('/status/')) {{
-                        return -1; // 标记为在错误页面
-                    }}
-                    
                     const items = document.querySelectorAll('{selector}');
                     let clicked = 0;
                     items.forEach(item => {{
-                        // 严格检查：可见、未被点击过、且文本精确匹配
-                        if (item && item.offsetParent !== null && !item.getAttribute('data-expanded')) {{
-                            const text = (item.innerText || item.textContent || '').trim().toLowerCase();
-                            const ariaLabel = (item.getAttribute('aria-label') || '').toLowerCase();
-                            
-                            // 只点击真正的 "Show more" 按钮
-                            const isShowMore = text === 'show more' || 
-                                              ariaLabel === 'show more' ||
-                                              item.getAttribute('data-testid') === 'tweet-text-show-more-link';
-                            
-                            if (isShowMore) {{
-                                item.setAttribute('data-expanded', 'true');
+                        // 检查元素是否可见且未被点击过
+                        if (item && item.click && item.offsetParent !== null) {{
+                            // 检查是否包含 "Show more" 或类似文本
+                            const text = item.innerText || item.textContent || '';
+                            const ariaLabel = item.getAttribute('aria-label') || '';
+                            if (text.toLowerCase().includes('show more') || 
+                                text.toLowerCase().includes('show') ||
+                                ariaLabel.toLowerCase().includes('show more') ||
+                                item.getAttribute('data-testid') === 'tweet-text-show-more-link') {{
                                 item.click();
                                 clicked++;
+                                // 标记为已点击
+                                item.setAttribute('data-expanded', 'true');
                             }}
                         }}
                     }});
@@ -149,11 +143,6 @@ class CDPSpider:
                 }})()
                 """
                 result = self._eval_js(ws_url, js_code)
-                
-                if result == -1:
-                    print(f"      ⚠️ 检测到在推文详情页，跳过展开操作")
-                    return
-                
                 clicked = int(result) if isinstance(result, (int, float)) else 0
                 if clicked > 0:
                     print(f"      展开 {clicked} 个折叠项 (尝试 {attempt + 1})")
@@ -388,7 +377,11 @@ class Presets:
             scroll_times=50,
             scroll_delay=2.5,  # 稍微增加滚动间隔
             expand_selectors=[
-                '[data-testid="tweet-text-show-more-link"]',  # Twitter 官方的长文本展开按钮
+                '[data-testid="tweet-text-show-more-link"]',  # 主要的长文本展开按钮
+                'button[role="button"]:has-text("Show more")',
+                'a[role="link"]:has-text("Show more")',
+                '[aria-label*="Show more"][role="button"]',
+                '[aria-label*="Show more"][role="link"]'
             ],
             expand_delay=1.5,  # 增加展开后等待时间
             field_processors={
