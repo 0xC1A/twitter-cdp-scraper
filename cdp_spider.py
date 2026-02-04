@@ -236,7 +236,8 @@ class CDPSpider:
             print(f"\n请先启动 Chrome:")
             print(f"  /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\")
             print(f"      --remote-debugging-port={self.chrome_port} \\")
-            print(f"      --remote-allow-origins='*'")
+            print(f"      --remote-allow-origins='*' \\")
+            print(f"      --user-data-dir=/tmp/chrome_dev_profile")
             return []
         print(f"✅ 已连接 ({browser})")
         
