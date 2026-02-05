@@ -35,7 +35,7 @@ class ExtractorConfig:
 
     # 滚动/分页配置
     scroll_enabled: bool = True        # 是否启用滚动
-    scroll_times: int = 50             # 最大滚动次数
+    scroll_times: int = 0              # 最大滚动次数 (0表示不限)
     scroll_delay: float = 2.0          # 滚动间隔(秒)
     scroll_selector: Optional[str] = None  # 滚动容器选择器 (None则滚动整个页面)
 
@@ -567,8 +567,9 @@ class CDPSpider:
 
         # 开始抓取
         print(f"\n🔍 开始抓取...")
+        scroll_limit_str = f"{config.scroll_times}" if config.scroll_times > 0 else "不限"
         print(f"   滚动策略: 小步长滚动 + 即时提取（应对虚拟滚动）")
-        print(f"   最大滚动次数: {config.scroll_times}")
+        print(f"   最大滚动次数: {scroll_limit_str}")
 
         all_items = {}
         ws_url = page['ws_url']
@@ -578,7 +579,13 @@ class CDPSpider:
         min_scroll_rounds = 10  # 最少滚动次数（防止长推文误判）
         last_top_item_id = None  # 上一次视口顶部的推文ID
         stuck_count = 0  # 视口顶部推文未变化的次数
-
+        
+        # 确认模式：检测到结束信号后，继续滚动 confirm_rounds 次确认
+        confirm_mode = False  # 是否进入确认模式
+        confirm_rounds = 10   # 确认模式需要滚动的次数
+        confirm_remaining = 0 # 确认模式剩余次数
+        confirm_trigger_reason = "" # 触发确认模式的原因
+        
         # 媒体下载配置
         download_media = getattr(config, 'download_media', False)
         media_dir = None
@@ -593,7 +600,10 @@ class CDPSpider:
         time.sleep(1)  # 等待虚拟滚动重新渲染
         print("   ✅ 已回到顶部，开始抓取\n")
 
-        for i in range(config.scroll_times if config.scroll_enabled else 1):
+        # 确定最大滚动次数（0表示不限，使用一个很大的数）
+        max_scroll_times = config.scroll_times if config.scroll_times > 0 else 10000
+        
+        for i in range(max_scroll_times if config.scroll_enabled else 1):
             # 提取数据（在滚动前也提取一次，确保第一屏的数据）
             items = self._extract_items(ws_url, config, download_media, media_dir)
 
@@ -665,13 +675,18 @@ class CDPSpider:
                 no_new_count += 1
             else:
                 no_new_count = 0
+                # 有新数据时，如果之前在确认模式，退出确认模式
+                if confirm_mode:
+                    print(f"      📢 确认模式中断：发现 {new_count} 条新数据")
+                    confirm_mode = False
+                    confirm_remaining = 0
 
             # 执行滚动，获取滚动结果
             scroll_result = self._scroll_page(ws_url, config, step=i+1)
             hit_bottom = scroll_result.get('hitBottom', False)
             actual_scrolled = scroll_result.get('actualScrolled', 0)
 
-            # 使用多重检测判断是否真正完成
+            # 检查是否满足结束信号
             done_check = self._check_if_really_done(
                 ws_url=ws_url,
                 no_new_count=no_new_count,
@@ -685,12 +700,36 @@ class CDPSpider:
                 stuck_count=stuck_count,
                 all_visible_crawled=all_visible_crawled,
                 hit_bottom=hit_bottom,
-                actual_scrolled=actual_scrolled
+                actual_scrolled=actual_scrolled,
+                visible_count=visible_check.get('visible_count', 0)
             )
 
+            # 确认模式逻辑
             if done_check['done']:
-                print(f"   ✅ {done_check['reason']}")
-                break
+                confidence = done_check.get('confidence', 'low')
+                
+                if confidence == 'high':
+                    # 强信号直接结束
+                    print(f"   ✅ {done_check['reason']}")
+                    break
+                elif not confirm_mode:
+                    # 中等/弱信号，进入确认模式
+                    confirm_mode = True
+                    confirm_remaining = confirm_rounds
+                    confirm_trigger_reason = done_check['reason']
+                    print(f"   ⚠️  {done_check['reason']}")
+                    print(f"      进入确认模式：继续滚动 {confirm_rounds} 次确认...")
+                # 如果已经在确认模式，继续确认流程
+            
+            # 确认模式计数
+            if confirm_mode:
+                if new_count == 0:
+                    confirm_remaining -= 1
+                    print(f"      确认中... 剩余 {confirm_remaining} 次")
+                    if confirm_remaining <= 0:
+                        print(f"   ✅ 确认完成：{confirm_trigger_reason}")
+                        break
+                # 如果有新数据，上面已经退出确认模式了
 
             # 更新状态，准备下一轮
             prev_scroll_top = current_scroll_top
@@ -708,31 +747,143 @@ class CDPSpider:
                                stuck_count: int = 0,
                                all_visible_crawled: bool = False,
                                hit_bottom: bool = False,
-                               actual_scrolled: int = 0) -> dict:
+                               actual_scrolled: int = 0,
+                               visible_count: int = 0) -> dict:
         """
-        多重检测判断是否真正到达底部 - 改进版，防止长推文误判
+        多重条件联合判定是否真正到达底部
 
-        关键改进：
-        1. 检测页面高度是否还在增长（height_grew）
-        2. 强制最小滚动次数（min_rounds）
-        3. 检测视口顶部推文是否卡住（stuck_count）
+        核心逻辑：必须满足【必要条件】+ 【多个充分条件】才结束
+
+        必要条件（必须满足）：
+        - 达到最小滚动次数 (current_round >= min_rounds)
+
+        结束信号（多条件组合判定）：
+        - 强信号：hitBottom + all_visible_crawled + 滚动百分比高
+        - 中信号：连续多轮无新数据 + all_visible_crawled + 页面高度稳定
+        - 弱信号：连续多轮无新数据 + 滚动百分比很高 + 无加载指示器
 
         Args:
-            ws_url: WebSocket URL
-            no_new_count: 连续N轮所有推文都是重复的次数
-            scroll_percent: 当前滚动百分比
-            prev_scroll_top: 上一轮滚动位置
-            all_duplicates_in_round: 当前轮次所有推文是否都是重复的
-            current_round: 当前滚动轮次
-            min_rounds: 最少滚动次数（防止过早停止）
-            height_grew: 页面高度是否还在增长
-            current_height: 当前页面高度
-            stuck_count: 视口顶部推文未变化的次数
+            visible_count: 当前可见推文数量（用于判断虚拟滚动是否卸载了太多内容）
 
         Returns:
-            {'done': bool, 'reason': str}
+            {'done': bool, 'reason': str, 'confidence': 'high'|'medium'|'low'}
         """
-        # === 强制最小滚动次数 ===
+
+        # === 必要条件检查 ===
+        if current_round < min_rounds:
+            return {'done': False, 'reason': f'未达到最小滚动次数 ({current_round}/{min_rounds})', 'confidence': 'none'}
+
+        # 如果可见推文数量很少（虚拟滚动卸载了大部分内容），要更谨慎
+        too_few_visible = visible_count <= 2 and current_round < min_rounds + 5
+
+        # === 收集各种信号 ===
+        signals = {
+            'no_new_for_3_rounds': no_new_count >= 3,
+            'no_new_for_2_rounds': no_new_count >= 2,
+            'all_duplicates': all_duplicates_in_round,
+            'height_stable': not height_grew,
+            'all_visible_crawled': all_visible_crawled,
+            'hit_bottom': hit_bottom,
+            'high_scroll_percent': scroll_percent >= 85,
+            'very_high_scroll_percent': scroll_percent >= 95,
+            'stuck': stuck_count >= 2,
+            'too_few_visible': too_few_visible,
+            'small_scroll': actual_scrolled < 100
+        }
+
+        # === 强信号判定：几乎可以确定到底 ===
+        # 必须同时满足：到底 + 所有可见已抓取 + (滚动百分比高 或 滚不动)
+        if signals['hit_bottom'] and signals['all_visible_crawled']:
+            if signals['high_scroll_percent'] or signals['small_scroll']:
+                return {
+                    'done': True,
+                    'reason': f'强信号：滚动到底部(滚动{actual_scrolled}px, {scroll_percent:.1f}%)且所有可见推文已抓取({visible_count}条)',
+                    'confidence': 'high'
+                }
+
+        # === 中信号判定：比较确定到底 ===
+        # 必须同时满足：连续3轮无新 + 所有可见已抓取 + 页面高度稳定 + 不是太少可见
+        if signals['no_new_for_3_rounds'] and signals['all_visible_crawled'] and signals['height_stable']:
+            if not signals['too_few_visible']:
+                return {
+                    'done': True,
+                    'reason': f'中信号：连续3轮无新数据，所有可见推文已抓取({visible_count}条)，页面稳定',
+                    'confidence': 'medium'
+                }
+
+        # === 弱信号判定：可能到底 ===
+        # 需要多个条件组合，且不能有反向信号
+        weak_score = 0
+        weak_conditions = [
+            signals['no_new_for_2_rounds'],
+            signals['all_duplicates'],
+            signals['height_stable'],
+            signals['high_scroll_percent'],
+            signals['stuck'],
+            signals['all_visible_crawled']
+        ]
+        weak_score = sum(weak_conditions)
+
+        # 弱信号需要至少5个条件（以前是4个，现在提高阈值因为会进入确认模式）
+        if weak_score >= 5 and not signals['too_few_visible']:
+            # 额外检查：是否有加载指示器
+            is_loading = self._eval_js(ws_url, """
+                (function() {
+                    const loaders = document.querySelectorAll([
+                        '[role="progressbar"]',
+                        '.loading',
+                        '[data-testid="loading"]',
+                        'svg[class*="loading"]',
+                        'div[class*="skeleton"]'
+                    ].join(','));
+                    return Array.from(loaders).some(l => {
+                        const rect = l.getBoundingClientRect();
+                        return rect.top >= 0 && rect.top <= window.innerHeight;
+                    });
+                })()
+            """) or False
+
+            if not is_loading:
+                return {
+                    'done': True,
+                    'reason': f'弱信号：满足{weak_score}/6个结束条件，无加载指示器',
+                    'confidence': 'low'
+                }
+
+        # === 文本结束标记检测 ===
+        end_marker = self._eval_js(ws_url, """
+            (function() {
+                const markers = [
+                    '没有更多推文', 'No more tweets', 'End of timeline',
+                    '已显示所有推文', 'All tweets shown', 'That\'s all for now',
+                    'Nothing more to see', 'You\'re all caught up'
+                ];
+                const allText = document.body.innerText || '';
+                return markers.some(m => allText.includes(m));
+            })()
+        """)
+
+        if end_marker and signals['no_new_for_2_rounds']:
+            return {
+                'done': True,
+                'reason': '检测到"没有更多推文"文本提示',
+                'confidence': 'high'
+            }
+
+        # === 返回未完成的详细原因 ===
+        true_signals = [k for k, v in signals.items() if v and k != 'too_few_visible']
+
+        return {
+            'done': False,
+            'reason': f'条件不满足（真信号:{len(true_signals)}/9, 弱评分:{weak_score}/6）',
+            'confidence': 'none'
+        }
+
+    def _make_progress_bar(self, percent: float, width: int = 20) -> str:
+        """创建进度条"""
+        filled = int(width * percent / 100)
+        bar = '█' * filled + '░' * (width - filled)
+        return f"[{bar}] {percent:5.1f}%"
         # 在前 min_rounds 轮，即使只看到重复内容也不停止
         # 这解决了"长推文展开后占据整个视口"的问题
         if current_round < min_rounds:
@@ -1160,7 +1311,6 @@ class Presets:
                 'replies': '[data-testid="reply"]',
                 'retweets': '[data-testid="retweet"]'
             },
-            scroll_times=50,
             scroll_delay=2.5,
             expand_selectors=[
                 '[data-testid="tweet-text-show-more-link"]',
@@ -1189,7 +1339,6 @@ class Presets:
                 'votes': '.VoteButton--up',
                 'comments': '.ContentItem-action:has(.CommentIcon)'
             },
-            scroll_times=30,
             expand_selectors=['.ContentItem-more', '.RichContent-inner--collapsed']
         )
 
@@ -1206,8 +1355,7 @@ class Presets:
                 'rating': '.main-title-rating',
                 'content': '.short-content',
                 'votes': '.action-btn.up span'
-            },
-            scroll_times=20
+            }
         )
 
     @staticmethod
