@@ -243,16 +243,59 @@ class CDPSpider:
         """获取当前滚动信息"""
         js_code = """
         (function() {
+            const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+            const scrollHeight = document.body.scrollHeight;
+            const viewportHeight = window.innerHeight;
+            const maxScroll = Math.max(1, scrollHeight - viewportHeight);
+            
             return {
-                scrollTop: window.pageYOffset || document.documentElement.scrollTop,
-                scrollHeight: document.body.scrollHeight,
-                viewportHeight: window.innerHeight,
-                scrollPercent: ((window.pageYOffset || document.documentElement.scrollTop) / 
-                               (document.body.scrollHeight - window.innerHeight) * 100).toFixed(1)
+                scrollTop: scrollTop,
+                scrollHeight: scrollHeight,
+                viewportHeight: viewportHeight,
+                scrollPercent: ((scrollTop / maxScroll) * 100).toFixed(1)
             };
         })()
         """
         return self._eval_js(ws_url, js_code) or {}
+    
+    def _get_top_visible_item_id(self, ws_url: str, config: ExtractorConfig) -> Optional[str]:
+        """
+        获取视口中最顶部可见的推文ID
+        用于检测是否真的在向前滚动
+        """
+        js_code = f"""
+        (function() {{
+            const articles = document.querySelectorAll('{config.item_selector}');
+            const viewportTop = window.pageYOffset || document.documentElement.scrollTop;
+            const viewportHeight = window.innerHeight;
+            
+            for (const article of articles) {{
+                const rect = article.getBoundingClientRect();
+                const articleTop = rect.top + viewportTop;
+                const idEl = article.querySelector('{config.id_field}') || 
+                            article.querySelector('a[href*="/status/"]');
+                
+                // 找到第一个在视口内或刚好在视口上方的推文
+                if (articleTop >= viewportTop - 100 && 
+                    articleTop <= viewportTop + viewportHeight * 0.5) {{
+                    let id = '';
+                    if (idEl) {{
+                        id = idEl.getAttribute('href') || idEl.innerText || '';
+                    }}
+                    if (!id) {{
+                        // 备用：使用索引
+                        id = 'idx_' + Array.from(articles).indexOf(article);
+                    }}
+                    return {{
+                        id: id.trim(),
+                        position: articleTop
+                    }};
+                }}
+            }}
+            return null;
+        }})()
+        """
+        return self._eval_js(ws_url, js_code)
     
     def _extract_items(self, ws_url: str, config: ExtractorConfig, download_media: bool = False, media_dir: Path = None) -> List[Dict]:
         """提取当前页面的所有项目"""
@@ -412,6 +455,10 @@ class CDPSpider:
         ws_url = page['ws_url']
         no_new_count = 0  # 连续没有新数据的次数
         prev_scroll_top = 0
+        prev_scroll_height = 0  # 上一次的页面高度
+        min_scroll_rounds = 10  # 最少滚动次数（防止长推文误判）
+        last_top_item_id = None  # 上一次视口顶部的推文ID
+        stuck_count = 0  # 视口顶部推文未变化的次数
         
         # 媒体下载配置
         download_media = getattr(config, 'download_media', False)
@@ -453,15 +500,31 @@ class CDPSpider:
             scroll_info = self._get_scroll_info(ws_url)
             scroll_percent = float(scroll_info.get('scrollPercent', 0))
             current_scroll_top = scroll_info.get('scrollTop', 0)
+            current_scroll_height = scroll_info.get('scrollHeight', 0)
+            
+            # 检测页面高度是否增长（有新内容加载）
+            height_grew = current_scroll_height > prev_scroll_height
+            
+            # 获取视口顶部推文ID，检测是否卡住
+            top_item = self._get_top_visible_item_id(ws_url, config)
+            top_item_id = top_item.get('id') if top_item else None
+            
+            if top_item_id == last_top_item_id:
+                stuck_count += 1
+            else:
+                stuck_count = 0
+                last_top_item_id = top_item_id
             
             # 显示进度
             progress_bar = self._make_progress_bar(scroll_percent)
             all_duplicates = len(items) > 0 and new_count == 0  # 当前获取的所有推文都是重复的
-            status_marker = "✓" if all_duplicates else " "
+            status_marker = "↑" if height_grew else ("✓" if all_duplicates else " ")
+            height_indicator = f"H+{current_scroll_height - prev_scroll_height:,}" if height_grew else ""
+            stuck_indicator = f" (stuck:{stuck_count})" if stuck_count > 0 else ""
             print(f"   第 {i+1:2d} 轮 | {progress_bar} | "
                   f"+{new_count:3d} 新数据 | "
                   f"重复:{duplicate_count:2d} | "
-                  f"总计:{len(all_items):4d} 条 [{status_marker}]")
+                  f"总计:{len(all_items):4d} 条 [{status_marker}] {height_indicator}{stuck_indicator}")
             
             # 检查是否需要停止
             if not config.scroll_enabled:
@@ -473,82 +536,166 @@ class CDPSpider:
             else:
                 no_new_count = 0
             
-            # 使用多重检测判断是否真正完成
+            # 使用多重检测判断是否真正完成（传入更多上下文）
             done_check = self._check_if_really_done(
-                ws_url, no_new_count, scroll_percent, prev_scroll_top, all_duplicates
+                ws_url=ws_url,
+                no_new_count=no_new_count,
+                scroll_percent=scroll_percent,
+                prev_scroll_top=prev_scroll_top,
+                all_duplicates_in_round=all_duplicates,
+                current_round=i+1,
+                min_rounds=min_scroll_rounds,
+                height_grew=height_grew,
+                current_height=current_scroll_height,
+                stuck_count=stuck_count
             )
             
             if done_check['done']:
                 print(f"   ✅ {done_check['reason']}")
                 break
             
-            # 小步长滚动
+            # 更新状态，准备下一轮
             prev_scroll_top = current_scroll_top
+            prev_scroll_height = current_scroll_height
             self._scroll_page(ws_url, config, step=i+1)
         
         return list(all_items.values())
     
     def _check_if_really_done(self, ws_url: str, no_new_count: int, 
                                scroll_percent: float, prev_scroll_top: float,
-                               all_duplicates_in_round: bool) -> dict:
+                               all_duplicates_in_round: bool,
+                               current_round: int = 0,
+                               min_rounds: int = 10,
+                               height_grew: bool = False,
+                               current_height: int = 0,
+                               stuck_count: int = 0) -> dict:
         """
-        多重检测判断是否真正到达底部
+        多重检测判断是否真正到达底部 - 改进版，防止长推文误判
+        
+        关键改进：
+        1. 检测页面高度是否还在增长（height_grew）
+        2. 强制最小滚动次数（min_rounds）
+        3. 检测视口顶部推文是否卡住（stuck_count）
         
         Args:
+            ws_url: WebSocket URL
             no_new_count: 连续N轮所有推文都是重复的次数
+            scroll_percent: 当前滚动百分比
+            prev_scroll_top: 上一轮滚动位置
             all_duplicates_in_round: 当前轮次所有推文是否都是重复的
+            current_round: 当前滚动轮次
+            min_rounds: 最少滚动次数（防止过早停止）
+            height_grew: 页面高度是否还在增长
+            current_height: 当前页面高度
+            stuck_count: 视口顶部推文未变化的次数
             
         Returns:
-            {
-                'done': bool,
-                'reason': str
-            }
+            {'done': bool, 'reason': str}
         """
-        # 条件1: 连续多次所有推文都是重复的 + 滚动位置不再变化
-        if no_new_count >= 3 and all_duplicates_in_round:
-            current_info = self._get_scroll_info(ws_url)
-            current_scroll_top = current_info.get('scrollTop', 0)
+        # === 强制最小滚动次数 ===
+        # 在前 min_rounds 轮，即使只看到重复内容也不停止
+        # 这解决了"长推文展开后占据整个视口"的问题
+        if current_round < min_rounds:
+            return {'done': False, 'reason': f'未达到最小滚动次数 ({current_round}/{min_rounds})'}
+        
+        # === 视口顶部推文卡住检测 ===
+        # 如果连续多轮视口顶部的推文都是同一个，说明我们可能卡在一个很长的推文里
+        # 但如果页面高度还在增长，说明推文下方有新内容，不要停止
+        if stuck_count >= 3 and not height_grew:
+            # 尝试强制滚动到下一个推文
+            forced_scroll = self._eval_js(ws_url, """
+                (function() {
+                    const articles = document.querySelectorAll('article[data-testid="tweet"]');
+                    const viewportTop = window.pageYOffset || document.documentElement.scrollTop;
+                    
+                    for (let i = 0; i < articles.length; i++) {
+                        const rect = articles[i].getBoundingClientRect();
+                        const articleTop = rect.top + viewportTop;
+                        
+                        // 找到第一个完全在视口下方的推文，滚动到它
+                        if (articleTop > viewportTop + window.innerHeight * 0.3) {
+                            window.scrollTo({
+                                top: articleTop,
+                                behavior: 'smooth'
+                            });
+                            return {scrolled: true, target: i};
+                        }
+                    }
+                    return {scrolled: false};
+                })()
+            """) or {}
             
-            # 等待一小段时间再检查，看是否有新内容加载
+            if forced_scroll.get('scrolled'):
+                return {'done': False, 'reason': f'尝试强制滚动到下一个推文'}
+        
+        # === 页面高度还在增长 ===
+        # 如果页面总高度还在增加，说明有新内容在加载，不要停止
+        if height_grew:
+            return {'done': False, 'reason': '页面高度仍在增长，继续滚动'}
+        
+        # === 检测是否在加载中 ===
+        is_loading = self._eval_js(ws_url, """
+            (function() {
+                // 检查各种加载指示器
+                const loaders = document.querySelectorAll([
+                    '[role="progressbar"]',
+                    '.loading',
+                    '[data-testid="loading"]',
+                    'svg[class*="loading"]',
+                    'div[class*="skeleton"]',
+                    '[data-testid="trend"]'
+                ].join(','));
+                const hasVisibleLoader = Array.from(loaders).some(l => {
+                    const rect = l.getBoundingClientRect();
+                    return rect.top >= 0 && rect.top <= window.innerHeight;
+                });
+                
+                // 检查是否有"加载更多"按钮
+                const loadMoreBtns = document.querySelectorAll('span, button');
+                let hasLoadMore = false;
+                for (const btn of loadMoreBtns) {
+                    const text = (btn.innerText || '').toLowerCase();
+                    if (text.includes('load more') || text.includes('加载更多') || 
+                        text.includes('show more replies') || text.includes('显示更多回复')) {
+                        hasLoadMore = true;
+                        break;
+                    }
+                }
+                
+                return {isLoading: hasVisibleLoader, hasLoadMore: hasLoadMore};
+            })()
+        """) or {}
+        
+        if is_loading.get('isLoading'):
+            return {'done': False, 'reason': '检测到加载指示器'}
+        
+        if is_loading.get('hasLoadMore'):
+            return {'done': False, 'reason': '检测到"加载更多"按钮'}
+        
+        # === 条件1: 连续多次所有推文都是重复的 + 页面高度稳定 ===
+        # 注意：需要在达到最小滚动次数后才判断
+        if no_new_count >= 3 and all_duplicates_in_round and not height_grew:
+            # 再次检查滚动位置是否变化（等待一小段时间）
             time.sleep(0.5)
             new_info = self._get_scroll_info(ws_url)
             new_scroll_top = new_info.get('scrollTop', 0)
             
-            # 如果滚动位置基本不变，说明真的到底了
-            if abs(new_scroll_top - current_scroll_top) < 10:
-                # 再检查一次DOM中是否有加载指示器
-                has_loader = self._eval_js(ws_url, """
-                    (function() {
-                        // 检查各种加载指示器
-                        const loaders = document.querySelectorAll([
-                            '[role="progressbar"]',
-                            '.loading',
-                            '[data-testid="loading"]',
-                            'svg[class*="loading"]',
-                            'div[class*="skeleton"]'
-                        ].join(','));
-                        return loaders.length > 0 && 
-                               Array.from(loaders).some(l => l.offsetParent !== null);
-                    })()
-                """)
-                
-                if not has_loader:
-                    return {'done': True, 'reason': f'连续{no_new_count}轮所有推文都是重复的且页面停止加载'}
+            # 如果滚动位置还在变化，说明正在滚动长推文内部
+            if abs(new_scroll_top - prev_scroll_top) > 50:
+                return {'done': False, 'reason': '滚动位置仍在变化，可能正在长推文内部滚动'}
+            
+            return {'done': True, 'reason': f'连续{no_new_count}轮无新数据且页面高度稳定'}
         
-        # 条件2: 滚动百分比很高 + 连续多次所有推文都是重复的
-        if scroll_percent >= 95 and no_new_count >= 2 and all_duplicates_in_round:
-            return {'done': True, 'reason': f'已滚动到{scroll_percent:.1f}%且连续{no_new_count}轮所有推文都是重复的'}
+        # === 条件2: 滚动百分比很高 + 连续多次所有推文都是重复的 ===
+        if scroll_percent >= 95 and no_new_count >= 2 and all_duplicates_in_round and not height_grew:
+            return {'done': True, 'reason': f'已滚动到{scroll_percent:.1f}%且连续{no_new_count}轮无新数据'}
         
-        # 条件3: 检查是否出现"没有更多推文"的提示
+        # === 条件3: 检查是否出现"没有更多推文"的提示 ===
         end_marker = self._eval_js(ws_url, """
             (function() {
-                // 检查各种可能的结束提示
                 const markers = [
-                    '没有更多推文',
-                    'No more tweets',
-                    'End of timeline',
-                    '已显示所有推文',
-                    'All tweets shown'
+                    '没有更多推文', 'No more tweets', 'End of timeline',
+                    '已显示所有推文', 'All tweets shown', 'That\'s all for now'
                 ];
                 const allText = document.body.innerText || '';
                 return markers.some(m => allText.includes(m));
