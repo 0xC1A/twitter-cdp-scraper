@@ -431,6 +431,9 @@ class CDPSpider:
 
             # 判断是否需要优先获取 href（如 id 字段或选择器包含链接相关）
             prefer_href = field_name in ['id', 'url', 'link'] or 'href' in selector
+            
+            # 对 time 字段特殊处理：优先获取 datetime 属性
+            is_time_field = field_name == 'time' or selector == 'time'
 
             field_extractors.append(f"""
                 // {field_name}
@@ -438,9 +441,15 @@ class CDPSpider:
                     const {field_name}El = article.querySelector('{selector}');
                     if ({field_name}El) {{
                         let text = '';
-
-                        // 对于 id/url/link 字段，优先获取 href
-                        if ({str(prefer_href).lower()}) {{
+                        
+                        // 对于 time 元素，优先获取 datetime 属性（精确时间）
+                        if ({str(is_time_field).lower()}) {{
+                            text = {field_name}El.getAttribute('datetime') || 
+                                   {field_name}El.getAttribute('title') || 
+                                   {field_name}El.innerText || 
+                                   {field_name}El.textContent || '';
+                        }} else if ({str(prefer_href).lower()}) {{
+                            // 对于 id/url/link 字段，优先获取 href
                             text = {field_name}El.getAttribute('href') || '';
                             if (!text) {{
                                 text = {field_name}El.innerText || {field_name}El.textContent || '';
@@ -1174,8 +1183,36 @@ class CDPSpider:
 
         # 排序
         if config and config.sort_field:
-            data.sort(key=lambda x: x.get(config.sort_field, ''),
-                     reverse=config.sort_reverse)
+            from datetime import datetime as dt
+            
+            def get_sort_key(item):
+                value = item.get(config.sort_field, '')
+                if not value:
+                    return ''
+                
+                # 尝试解析 ISO 8601 时间格式 (2024-02-06T15:30:00.000Z)
+                if isinstance(value, str):
+                    # 尝试多种时间格式
+                    time_formats = [
+                        '%Y-%m-%dT%H:%M:%S.%fZ',
+                        '%Y-%m-%dT%H:%M:%SZ',
+                        '%Y-%m-%dT%H:%M:%S.%f%z',
+                        '%Y-%m-%dT%H:%M:%S%z',
+                        '%Y-%m-%d %H:%M:%S',
+                        '%Y-%m-%d'
+                    ]
+                    for fmt in time_formats:
+                        try:
+                            parsed = dt.strptime(value, fmt)
+                            # 返回时间戳用于排序
+                            return parsed.timestamp()
+                        except ValueError:
+                            continue
+                
+                # 如果无法解析为时间，按原值字符串排序
+                return str(value)
+            
+            data.sort(key=get_sort_key, reverse=config.sort_reverse)
 
         # ===== 1. 保存原始 JSON（最权威的数据源） =====
         json_file = self.output_dir / f"{base_name}.json"
@@ -1403,6 +1440,8 @@ def main():
     if preset == 'twitter':
         username = sys.argv[2] if len(sys.argv) > 2 else input("输入 Twitter 用户名: ")
         config = Presets.twitter(username)
+        # 使用用户名作为文件名前缀
+        preset = username
     elif preset == 'zhihu':
         config = Presets.zhihu_answers()
     elif preset == 'douban':
